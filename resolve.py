@@ -40,6 +40,8 @@ def collect_results(name: str) -> dict:
     target_name = dns.name.from_text(name)
     # lookup CNAME
     response = lookup(target_name, dns.rdatatype.CNAME)
+    if response is None:
+        return full_response
     cnames = []
     tmp = name
     for answers in response.answer:
