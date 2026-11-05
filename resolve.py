@@ -10,6 +10,7 @@ import dns.query
 import dns.rdata
 import dns.rdataclass
 import dns.rdatatype
+import dns.flags
 
 FORMATS = (("CNAME", "{alias} is an alias for {name}"),
            ("A", "{name} has address {address}"),
@@ -36,8 +37,9 @@ def collect_results(name: str) -> dict:
     This function parses final answers into the proper data structure that
     print_results requires. The main work is done within the `lookup` function.
     """
-    full_response = {}  
+    full_response = {}
     target_name = dns.name.from_text(name)
+
     # lookup CNAME
     response = lookup(target_name, dns.rdatatype.CNAME)
     if response is None:
@@ -48,24 +50,33 @@ def collect_results(name: str) -> dict:
         for answer in answers:
             cnames.append({"name": answer, "alias": tmp})
             tmp = answer
+
     # lookup A
     response = lookup(target_name, dns.rdatatype.A)
+    if response is None:
+        return full_response
     arecords = []
     for answers in response.answer:
         a_name = answers.name
         for answer in answers:
             if answer.rdtype == 1:  # A record
                 arecords.append({"name": a_name, "address": str(answer)})
+
     # lookup AAAA
     response = lookup(target_name, dns.rdatatype.AAAA)
+    if response is None:
+        return full_response
     aaaarecords = []
     for answers in response.answer:
         aaaa_name = answers.name
         for answer in answers:
             if answer.rdtype == 28:  # AAAA record
                 aaaarecords.append({"name": aaaa_name, "address": str(answer)})
+
     # lookup MX
     response = lookup(target_name, dns.rdatatype.MX)
+    if response is None:
+        return full_response
     mxrecords = []
     for answers in response.answer:
         mx_name = answers.name
@@ -81,6 +92,7 @@ def collect_results(name: str) -> dict:
     full_response["MX"] = mxrecords
 
     return full_response
+
 
 def get_referral_ips(response: dns.message.Message) -> list:
     """
@@ -100,6 +112,7 @@ def get_referral_ips(response: dns.message.Message) -> list:
                 ips.append(rdata.address)
     return ips
 
+
 def lookup(target_name: dns.name.Name,
            qtype: dns.rdata.Rdata) -> dns.message.Message:
     """
@@ -108,21 +121,25 @@ def lookup(target_name: dns.name.Name,
     """
     outbound_query = dns.message.make_query(target_name, qtype)
     servers = [ROOT_SERVERS[0]]
+    tried = set()
 
     while servers:
         server = servers.pop(0)
+        if server in tried:
+            continue
+        tried.add(server)
         try:
             response = dns.query.udp(outbound_query, server, 3)
         except Exception:
             continue
-        print(response)
 
-        if response.answer:
+        if response.answer or response.flags & dns.flags.AA:
             return response
 
-        servers = get_referral_ips(response)
+        servers.extend(get_referral_ips(response))
 
-    return response
+    return None
+
 
 def print_results(results: dict) -> None:
     """
@@ -150,6 +167,6 @@ def main():
     for a_domain_name in program_args.name:
         print_results(collect_results(a_domain_name))
 
+
 if __name__ == "__main__":
-    print(get_referral_ips(lookup(dns.name.from_text("uic.edu."), dns.rdatatype.A)))
     main()
