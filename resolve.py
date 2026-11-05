@@ -36,7 +36,7 @@ def collect_results(name: str) -> dict:
     This function parses final answers into the proper data structure that
     print_results requires. The main work is done within the `lookup` function.
     """
-    full_response = {}
+    full_response = {}  
     target_name = dns.name.from_text(name)
     # lookup CNAME
     response = lookup(target_name, dns.rdatatype.CNAME)
@@ -80,20 +80,47 @@ def collect_results(name: str) -> dict:
 
     return full_response
 
+def get_referral_ips(response: dns.message.Message) -> list:
+    """
+    Return the IPv4 addresses from the additional section of a referral
+    that belong to nameservers listed in the authority section.
+    """
+    ns_names = set()
+    for rrset in response.authority:
+        if rrset.rdtype == dns.rdatatype.NS:
+            for rdata in rrset:
+                ns_names.add(rdata.target)
+
+    ips = []
+    for rrset in response.additional:
+        if rrset.rdtype == dns.rdatatype.A and rrset.name in ns_names:
+            for rdata in rrset:
+                ips.append(rdata.address)
+    return ips
 
 def lookup(target_name: dns.name.Name,
            qtype: dns.rdata.Rdata) -> dns.message.Message:
     """
-    This function uses a recursive resolver to find the relevant answer to the
-    query.
-
-    TODO: replace this implementation with one which asks the root servers
-    and recurses to find the proper answer.
+    Iteratively resolve target_name for qtype, starting at a root server
+    and following referrals until an answer appears.
     """
     outbound_query = dns.message.make_query(target_name, qtype)
-    response = dns.query.udp(outbound_query, "8.8.8.8", 3)
-    return response
+    servers = [ROOT_SERVERS[0]]
 
+    while servers:
+        server = servers.pop(0)
+        try:
+            response = dns.query.udp(outbound_query, server, 3)
+        except Exception:
+            continue
+        print(response)
+
+        if response.answer:
+            return response
+
+        servers = get_referral_ips(response)
+
+    return response
 
 def print_results(results: dict) -> None:
     """
@@ -122,4 +149,5 @@ def main():
         print_results(collect_results(a_domain_name))
 
 if __name__ == "__main__":
+    print(get_referral_ips(lookup(dns.name.from_text("uic.edu."), dns.rdatatype.A)))
     main()
