@@ -107,58 +107,59 @@ def _ask(target_name, qtype, servers):
     Query the given servers, following referrals, until an answer appears.
     Returns the response, or None if nothing answered.
     """
-
     outbound_query = dns.message.make_query(target_name, qtype)
     servers = list(servers)
     tried = set()
+    qtype_txt = dns.rdatatype.to_text(qtype)
 
     while servers:
         server = servers.pop(0)
-
         if server in tried or server in FAILED:
             continue
-
         tried.add(server)
-        """
-        # Start timing this DNS query
-        t = time.time()
 
+        # Time this query
+        t = time.time()
         try:
             response = dns.query.udp(outbound_query, server, 3)
-
         except Exception as e:
-            print(
-                f"[{time.time()-START:5.2f}s] {server:16} {target_name} "
-                f"{dns.rdatatype.to_text(qtype)} FAILED {type(e).__name__}"
-            )
-
+            print(f"[{time.time()-START:5.2f}s] {server:16} {target_name} "
+                  f"{qtype_txt} FAILED {type(e).__name__}")
             FAILED.add(server)
             continue
-        """
 
-        # Print successful query timing
-        print(
-            f"[{time.time()-START:5.2f}s] {server:16} {target_name} "
-            f"{dns.rdatatype.to_text(qtype)} {(time.time()-t)*1000:.0f}ms"
-        )
+        print(f"[{time.time()-START:5.2f}s] {server:16} {target_name} "
+              f"{qtype_txt} {(time.time()-t)*1000:.0f}ms")
 
+        # Got an answer (or an authoritative "no such name")
         if response.answer or response.flags & dns.flags.AA:
             return response
 
+        # Referral: use glue IPs if present...
         next_ips = get_referral_ips(response)
 
-
+        # ...otherwise resolve the NS names ourselves (stop at the first that works)
         if not next_ips:
             for rrset in response.authority:
                 if rrset.rdtype == dns.rdatatype.NS:
                     for rdata in rrset:
                         next_ips.extend(resolve_ns_ip(rdata.target))
                         if next_ips:
-                            break      # stop after the FIRST NS that resolves
+                            break
                 if next_ips:
                     break
+
         if next_ips:
+            # Cache this zone's servers so later lookups skip the parent zones
+            for rrset in response.authority:
+                if rrset.rdtype == dns.rdatatype.NS:
+                    ZONE_SERVERS[rrset.name] = list(next_ips)
+                    break
+            # Move down the tree: query the new servers next
             servers = list(next_ips)
+
+    return None
+
 
 
 def _lookup_uncached(target_name, qtype):
