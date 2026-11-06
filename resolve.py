@@ -130,9 +130,7 @@ def _ask(target_name, qtype, servers):
                     for rdata in rrset:
                         next_ips.extend(resolve_ns_ip(rdata.target))
                         if next_ips:
-                            break
-                if next_ips:
-                    break    
+                            servers= list(next_ips)   
 
         if next_ips:
             # Remember which servers handle this zone so later lookups
@@ -190,7 +188,7 @@ def collect_results(name):
         if target is None:
             break
         full_response["CNAME"].append({"alias": text(current),
-                                       "name": text.to_text()})
+                                       "name": target.to_text()})
         current = target
 
     # Query records on the final name.
