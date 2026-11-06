@@ -129,8 +129,8 @@ def _ask(target_name, qtype, servers):
                 if rrset.rdtype == dns.rdatatype.NS:
                     for rdata in rrset:
                         next_ips.extend(resolve_ns_ip(rdata.target))
-                    if next_ips:
-                        break
+                        if next_ips:
+                            break
                 if next_ips:
                     break    
 
@@ -185,7 +185,7 @@ def collect_results(name):
         target = None
         for rrset in response.answer:
             if rrset.rdtype == dns.rdatatype.CNAME:
-                target = rrset[0].target.to_text
+                target = rrset[0].target
                 break
         if target is None:
             break
