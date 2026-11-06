@@ -35,6 +35,8 @@ CACHE = {}            # (dns.name.Name, rdtype) -> Message or None
 ZONE_SERVERS = {}     # zone dns.name.Name -> list of IPv4 strings
 RESOLVING_NS = set()  # NS names currently being resolved (cycle guard)
 
+FAILED = set()
+
 
 def text(name):
     """Format a dns name without the trailing dot, like host does."""
@@ -109,12 +111,13 @@ def _ask(target_name, qtype, servers):
 
     while servers:
         server = servers.pop(0)
-        if server in tried:
+        if server in tried or server in FAILED:
             continue
         tried.add(server)
         try:
             response = dns.query.udp(outbound_query, server, 3)
         except Exception:
+            FAILED.add(server)
             continue
 
         if response.answer or response.flags & dns.flags.AA:
@@ -128,6 +131,8 @@ def _ask(target_name, qtype, servers):
                         next_ips.extend(resolve_ns_ip(rdata.target))
                     if next_ips:
                         break
+                if next_ips:
+                    break    
 
         if next_ips:
             # Remember which servers handle this zone so later lookups
@@ -180,12 +185,12 @@ def collect_results(name):
         target = None
         for rrset in response.answer:
             if rrset.rdtype == dns.rdatatype.CNAME:
-                target = rrset[0].target
+                target = rrset[0].target.to_text
                 break
         if target is None:
             break
         full_response["CNAME"].append({"alias": text(current),
-                                       "name": text(target)})
+                                       "name": text.to_text()})
         current = target
 
     # Query records on the final name.
