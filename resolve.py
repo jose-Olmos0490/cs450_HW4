@@ -31,70 +31,17 @@ ROOT_SERVERS = ("198.41.0.4",
                 "199.7.83.42",
                 "202.12.27.33")
 
-
-def collect_results(name: str) -> dict:
-    """
-    This function parses final answers into the proper data structure that
-    print_results requires. The main work is done within the `lookup` function.
-    """
-    full_response = {}
-    target_name = dns.name.from_text(name)
-
-    # lookup CNAME
-    response = lookup(target_name, dns.rdatatype.CNAME)
-    if response is None:
-        return full_response
-    cnames = []
-    tmp = name
-    for answers in response.answer:
-        for answer in answers:
-            cnames.append({"name": answer, "alias": tmp})
-            tmp = answer
-
-    # lookup A
-    response = lookup(target_name, dns.rdatatype.A)
-    if response is None:
-        return full_response
-    arecords = []
-    for answers in response.answer:
-        a_name = answers.name
-        for answer in answers:
-            if answer.rdtype == 1:  # A record
-                arecords.append({"name": a_name, "address": str(answer)})
-
-    # lookup AAAA
-    response = lookup(target_name, dns.rdatatype.AAAA)
-    if response is None:
-        return full_response
-    aaaarecords = []
-    for answers in response.answer:
-        aaaa_name = answers.name
-        for answer in answers:
-            if answer.rdtype == 28:  # AAAA record
-                aaaarecords.append({"name": aaaa_name, "address": str(answer)})
-
-    # lookup MX
-    response = lookup(target_name, dns.rdatatype.MX)
-    if response is None:
-        return full_response
-    mxrecords = []
-    for answers in response.answer:
-        mx_name = answers.name
-        for answer in answers:
-            if answer.rdtype == 15:  # MX record
-                mxrecords.append({"name": mx_name,
-                                  "preference": answer.preference,
-                                  "exchange": str(answer.exchange)})
-
-    full_response["CNAME"] = cnames
-    full_response["A"] = arecords
-    full_response["AAAA"] = aaaarecords
-    full_response["MX"] = mxrecords
-
-    return full_response
+CACHE = {}            # (dns.name.Name, rdtype) -> Message or None
+ZONE_SERVERS = {}     # zone dns.name.Name -> list of IPv4 strings
+RESOLVING_NS = set()  # NS names currently being resolved (cycle guard)
 
 
-def get_referral_ips(response: dns.message.Message) -> list:
+def text(name):
+    """Format a dns name without the trailing dot, like host does."""
+    return name.to_text(omit_final_dot=True)
+
+
+def get_referral_ips(response):
     """
     Return the IPv4 addresses from the additional section of a referral
     that belong to nameservers listed in the authority section.
@@ -113,14 +60,51 @@ def get_referral_ips(response: dns.message.Message) -> list:
     return ips
 
 
-def lookup(target_name: dns.name.Name,
-           qtype: dns.rdata.Rdata) -> dns.message.Message:
+def closest_servers(name):
     """
-    Iteratively resolve target_name for qtype, starting at a root server
-    and following referrals until an answer appears.
+    Return the servers for the deepest zone we already know about,
+    walking up from name toward the root.
+    """
+    n = name
+    while True:
+        if n in ZONE_SERVERS:
+            return list(ZONE_SERVERS[n])
+        if n == dns.name.root:
+            return list(ROOT_SERVERS)
+        n = n.parent()
+
+
+def resolve_ns_ip(ns_name):
+    """
+    Resolve an NS name with no glue to IPv4 addresses by looking up its A record.
+    The RESOLVING_NS set stops infinite loops when nameservers depend on
+    each other for their own addresses.
+    """
+    if ns_name in RESOLVING_NS:
+        return []
+    RESOLVING_NS.add(ns_name)
+    try:
+        response = lookup(ns_name, dns.rdatatype.A)
+    finally:
+        RESOLVING_NS.discard(ns_name)
+
+    if response is None:
+        return []
+    ips = []
+    for rrset in response.answer:
+        if rrset.rdtype == dns.rdatatype.A:
+            for rdata in rrset:
+                ips.append(rdata.address)
+    return ips
+
+
+def _ask(target_name, qtype, servers):
+    """
+    Query the given servers, following referrals, until an answer appears.
+    Returns the response, or None if nothing answered.
     """
     outbound_query = dns.message.make_query(target_name, qtype)
-    servers = [ROOT_SERVERS[0]]
+    servers = list(servers)
     tried = set()
 
     while servers:
@@ -142,9 +126,15 @@ def lookup(target_name: dns.name.Name,
                 if rrset.rdtype == dns.rdatatype.NS:
                     for rdata in rrset:
                         next_ips.extend(resolve_ns_ip(rdata.target))
-                        if next_ips:
-                            break
-                if next_ips:
+                    if next_ips:
+                        break
+
+        if next_ips:
+            # Remember which servers handle this zone so later lookups
+            # under it skip the parent zones.
+            for rrset in response.authority:
+                if rrset.rdtype == dns.rdatatype.NS:
+                    ZONE_SERVERS[rrset.name] = list(next_ips)
                     break
 
         servers.extend(next_ips)
@@ -152,37 +142,91 @@ def lookup(target_name: dns.name.Name,
     return None
 
 
-def print_results(results: dict) -> None:
+def _lookup_uncached(target_name, qtype):
     """
-    take the results of a `lookup` and print them to the screen like the host
-    program would.
+    Start at the closest known zone. If that fails, fall back to the roots.
     """
+    start = closest_servers(target_name)
+    response = _ask(target_name, qtype, start)
+    if response is None and start != list(ROOT_SERVERS):
+        response = _ask(target_name, qtype, ROOT_SERVERS)
+    return response
 
+
+def lookup(target_name, qtype):
+    """
+    Cached wrapper around _lookup_uncached. Failed lookups (None) are
+    cached too, so they are not retried.
+    """
+    key = (target_name, qtype)
+    if key not in CACHE:
+        CACHE[key] = _lookup_uncached(target_name, qtype)
+    return CACHE[key]
+
+
+def collect_results(name):
+    """
+    Parse final answers into the structure print_results needs.
+    Follows CNAME chains, then queries A/AAAA/MX on the final name.
+    """
+    full_response = {"CNAME": [], "A": [], "AAAA": [], "MX": []}
+    current = dns.name.from_text(name)
+
+    # Follow the CNAME chain, one link at a time.
+    for _ in range(10):  # cap to avoid CNAME loops
+        response = lookup(current, dns.rdatatype.CNAME)
+        if response is None:
+            break
+        target = None
+        for rrset in response.answer:
+            if rrset.rdtype == dns.rdatatype.CNAME:
+                target = rrset[0].target
+                break
+        if target is None:
+            break
+        full_response["CNAME"].append({"alias": text(current),
+                                       "name": text(target)})
+        current = target
+
+    # Query records on the final name.
+    response = lookup(current, dns.rdatatype.A)
+    if response is not None:
+        for rrset in response.answer:
+            if rrset.rdtype == dns.rdatatype.A:
+                for rdata in rrset:
+                    full_response["A"].append({"name": text(rrset.name),
+                                               "address": rdata.address})
+
+    response = lookup(current, dns.rdatatype.AAAA)
+    if response is not None:
+        for rrset in response.answer:
+            if rrset.rdtype == dns.rdatatype.AAAA:
+                for rdata in rrset:
+                    full_response["AAAA"].append({"name": text(rrset.name),
+                                                  "address": rdata.address})
+
+    response = lookup(current, dns.rdatatype.MX)
+    if response is not None:
+        for rrset in response.answer:
+            if rrset.rdtype == dns.rdatatype.MX:
+                for rdata in rrset:
+                    full_response["MX"].append({"name": text(rrset.name),
+                                                "preference": rdata.preference,
+                                                "exchange": str(rdata.exchange)})
+
+    return full_response
+
+
+def print_results(results):
+    """
+    Print results the way the host program would.
+    """
     for rtype, fmt_str in FORMATS:
         for result in results.get(rtype, []):
             print(fmt_str.format(**result))
 
 
-def resolve_ns_ip(ns_name: dns.name.Name) -> list:
-    """
-    Resolve an NS name with no glue to IPv4 addresses by looking up its A record.
-    """
-    response = lookup(ns_name, dns.rdatatype.A)
-    if response is None:
-        return []
-    ips = []
-    for rrset in response.answer:
-        if rrset.rdtype == dns.rdatatype.A:
-            for rdata in rrset:
-                ips.append(rdata.address)
-    return ips
-
-
 def main():
-    """
-    if run from the command line, take args and call
-    printresults(lookup(hostname))
-    """
     argument_parser = argparse.ArgumentParser()
     argument_parser.add_argument("name", nargs="+",
                                  help="DNS name(s) to look up")
@@ -190,8 +234,18 @@ def main():
                                  help="increase output verbosity",
                                  action="store_true")
     program_args = argument_parser.parse_args()
+
     for a_domain_name in program_args.name:
-        print_results(collect_results(a_domain_name))
+        try:
+            results = collect_results(a_domain_name)
+        except Exception:
+            results = {}
+
+        if not any(results.get(k) for k in ("CNAME", "A", "AAAA", "MX")):
+            # Never print nothing: say what happened.
+            print(f"{a_domain_name}: lookup failed or no records found")
+        else:
+            print_results(results)
 
 
 if __name__ == "__main__":
