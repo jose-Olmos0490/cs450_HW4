@@ -136,7 +136,18 @@ def lookup(target_name: dns.name.Name,
         if response.answer or response.flags & dns.flags.AA:
             return response
 
-        servers.extend(get_referral_ips(response))
+        next_ips = get_referral_ips(response)
+        if not next_ips:
+            for rrset in response.authority:
+                if rrset.rdtype == dns.rdatatype.NS:
+                    for rdata in rrset:
+                        next_ips.extend(resolve_ns_ip(rdata.target))
+                        if next_ips:
+                            break
+                if next_ips:
+                    break
+
+        servers.extend(next_ips)
 
     return None
 
@@ -150,6 +161,21 @@ def print_results(results: dict) -> None:
     for rtype, fmt_str in FORMATS:
         for result in results.get(rtype, []):
             print(fmt_str.format(**result))
+
+
+def resolve_ns_ip(ns_name: dns.name.Name) -> list:
+    """
+    Resolve an NS name with no glue to IPv4 addresses by looking up its A record.
+    """
+    response = lookup(ns_name, dns.rdatatype.A)
+    if response is None:
+        return []
+    ips = []
+    for rrset in response.answer:
+        if rrset.rdtype == dns.rdatatype.A:
+            for rdata in rrset:
+                ips.append(rdata.address)
+    return ips
 
 
 def main():
